@@ -1,0 +1,203 @@
+version: '3.8'
+
+services:
+  # --- 1. Aplicación Backend ---
+  backend:
+    build:
+      context: ./tpf-backend
+    container_name: tpf-backend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      DB_HOST: mysql-db
+      DB_USER: root
+      DB_PASSWORD: root
+      DB_NAME: tpf_db_d
+    networks:
+      - app-network
+    depends_on:
+      mysql-db:
+        condition: service_healthy
+
+  # --- 2. Aplicación Frontend ---
+  frontend:
+    build:
+      context: ./tpf-frontend
+    container_name: tpf-frontend
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    networks:
+      - app-network
+    depends_on:
+      - backend
+
+  # --- 3. Base de Datos ---
+  mysql-db:
+    image: mysql:8.0
+    container_name: mysql-db
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: tpf_db_d
+    ports:
+      - "3308:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-proot"]
+      interval: 5s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+
+  # --- 4. PhpMyAdmin ---
+  phpmyadmin:
+    image: phpmyadmin/phpmyadmin:latest
+    container_name: phpmyadmin
+    environment:
+      PMA_HOST: mysql-db
+      MYSQL_ROOT_PASSWORD: root
+    ports:
+      - "8080:80"
+    depends_on:
+      mysql-db:
+        condition: service_healthy
+    networks:
+      - app-network
+
+  # --- 5. Servicio de Backup ---
+  backup:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mysql-backup
+    volumes:
+      - ./backups:/backups
+    environment:
+      DB_HOST: mysql-db
+      DB_USER: root
+      DB_PASSWORD: root
+      DB_NAME: tpf_db_d
+    depends_on:
+      mysql-db:
+        condition: service_healthy
+    networks:
+      - app-network
+
+  # --- 6. Prometheus ---
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus2
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    command: --config.file=/etc/prometheus/prometheus.yml
+    networks:
+      - app-network
+      - monitoring
+    depends_on:
+      - node-exporter
+      - cadvisor
+      - mysqld-exporter
+
+  # --- 7. Grafana ---
+  grafana:
+    image: grafana/grafana-oss:latest
+    container_name: grafana2
+    restart: unless-stopped
+    ports:
+      - "3001:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana-datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    networks:
+      - app-network
+      - monitoring
+    depends_on:
+      - prometheus
+
+  # --- 8. Node Exporter ---
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: node-exporter
+    restart: unless-stopped
+    expose:
+      - "9100"
+    networks:
+      - monitoring
+
+  # --- 9. cAdvisor ---
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:latest
+    container_name: cadvisor
+    restart: unless-stopped
+    expose:
+      - "8080" # usamos el puerto interno correcto
+    ports:
+      - "8081:8080" # visible desde el host si querés acceder
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:rw
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    networks:
+      - monitoring
+
+  # --- 10. MySQL Exporter ---
+  mysqld-exporter:
+    image: prom/mysqld-exporter:latest
+    container_name: mysqld-exporter
+    restart: unless-stopped
+    expose:
+      - "9104"
+    command:
+      - --config.my-cnf=/cfg/config-exporter.cnf
+    volumes:
+      - ./config-exporter.cnf:/cfg/config-exporter.cnf:ro
+    networks:
+      - monitoring
+      - app-network
+    depends_on:
+      mysql-db:
+        condition: service_healthy
+
+  # 11. MySqlTuner
+  mysqltuner:
+    image: debian:bullseye-slim
+    container_name: mysqltuner
+    depends_on:
+      mysql-db:
+        condition: service_healthy
+    networks:
+      - app-network
+    command: >
+      bash -c "
+        apt-get update && apt-get install -y mariadb-client perl curl &&
+        curl -sL https://raw.githubusercontent.com/major/MySQLTuner-perl/master/mysqltuner.pl > /mysqltuner.pl &&
+        chmod +x /mysqltuner.pl &&
+        sleep 15 &&
+        perl /mysqltuner.pl --host mysql --user root --pass root
+      "    
+
+# --- Redes y Volúmenes ---
+networks:
+  app-network:
+    driver: bridge
+  monitoring:
+    driver: bridge
+
+volumes:
+  mysql_data:
+  prometheus-data:
+  grafana-data:
